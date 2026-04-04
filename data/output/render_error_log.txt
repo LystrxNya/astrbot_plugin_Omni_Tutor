@@ -1,0 +1,6 @@
+=== 渲染引擎崩溃报告 ===
+Traceback (most recent call last):
+  File "C:\Users\fangf\.astrbot\data\plugins\developing_plugin\core\renderer.py", line 71, in render_to_image
+    output_path = os.path.join(self.output_dir, f"render_{int(time.time()*100)}.png")
+                  ^^
+UnboundLocalError: cannot access local variable 'os' where it is not associated with a value

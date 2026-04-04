@@ -1,14 +1,71 @@
-# astrbot-plugin-helloworld
+# OmniTutor: 全知导师
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+OmniTutor 是一款基于 AstrBot 框架开发的深度学术科研与知识管理插件。它集成了双脑模型驱动（Fast & Reasoning Models）、异构知识图谱、动态认知追踪以及全自动 RAG 检索流，旨在为用户提供从资料录入到深度重构的闭环学习体验。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 核心架构概览
 
-# Supports
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+### 1. 双脑协同引擎
+* **快脑 (Fast Model)**: 负责高并发的文档打标、基础 OCR 解析及实时意图过滤。
+* **慢脑 (Reasoning Model)**: 负责复杂的学术重构、多维意图裂变以及认知障碍分析。
+
+### 2. 双路图谱检索 (Hybrid Retrieval)
+* **第一路 (概念路由)**: 通过慢脑预测的学术概念在图谱标签库中进行向量碰撞，精准定位相关知识节点。
+* **第二路 (语义盲捞)**: 基于向量相似度在全库进行语义搜索，确保检索结果的完整性。
+* **智能重排 (Rerank)**: 使用 BGE-Reranker 对双路召回结果进行交叉注意力评分，只保留最高度相关的学术切片。
+
+### 3. 动态认知追踪 (Cognitive Tracking)
+* 系统会根据用户的提问和导师的回答，自动计算用户对特定学科和概念的掌握度（Mastery）与认知阻力（Struggle）。
+* 内置遗忘曲线算法，根据交互时间动态衰减掌握度，实现真实的知识留存预测。
+
+---
+
+## 指令集说明
+
+### 知识录入与维护
+* **/学习**: 进入主库录入模式。支持图片、PDF、Word、PPT 等多格式文件。支持 5 秒防抖打包逻辑。
+* **/精读**: 开启深度思考模式。针对长篇资料进行学术重构，并下发结构化的 Markdown 笔记。
+* **/重要录入**: 针对零碎知识点（如账号、公式、临考要点）的专用录入通道。
+* **/存入 [指令]**: 将上一次对话内容进行学术提纯后回流至知识库。
+* **/遗忘 [关键词]**: 模糊匹配并物理删除主库中的相关档案。
+* **/撤销**: 撤回最后一次落盘的知识录入操作。
+
+### 图谱管理 (手术刀系列)
+* **/自清洗**: 触发全库图谱归一化。对同义词、近义词进行自动坍缩合并，重连底层切片羁绊。
+* **/合并概念 [旧名] [新名]**: 手动强制合并两个学术节点。
+* **/清洗概念 [名称]**: 针对特定节点进行相似度再校准。
+* **/重塑概念 [名称]**: 高级指令。将属于该概念的所有物理切片取出，由大模型重新进行学术重写、去重并重新打标入库。
+
+### 诊断与展示
+* **/诊断**: 生成基于遗忘曲线的个人认知报告长图。
+* **/图谱**: 展示当前知识库的扁平化概念图谱及学科分布。
+* **/档案**: 列出当前主库已加载的所有学术资源清单。
+
+---
+
+## 技术特性
+
+### 1. 智能图谱坍缩逻辑
+插件在后台会自动运行归一化任务。当新词入库时，会先通过向量相似度进行本地物理拦截（阈值 0.92），若无法确定则调用大模型进行学术语义裁定，确保图谱节点的纯净度。
+
+### 2. 物理切片重连机制
+在任何概念合并或重构操作中，系统均会自动重构 `chunk_tag_mapping` 桥接表，确保物理文本切片始终与最新的学术标签保持正确关联，避免产生检索不到的孤儿数据。
+
+### 3. 检索防爆策略
+内置 `MAX_CANDIDATES` 保护阀。当图谱召回候选集过多时，系统采用“15个语义保底 + 随机图谱采样”的混合策略，确保 BGE-Reranker 在高吞吐量下的稳定性。
+
+### 4. 智能图文缝合
+全局拦截器会自动识别纯图片输入，并开启 8 秒等待窗口。若用户随后发送文字，系统将自动执行图文缝合，将上下文信息完整投喂给视觉模型。
+
+---
+
+## 部署要求
+
+* **API Key**: 需要配置阿里云百炼 (Dashscope) 和 SiliconFlow 的有效密钥。
+* **模型配置**: 建议使用 `qwen-vl-max` 作为视觉核心，`qwen3.5-flash` 作为逻辑核心。
+* **依赖库**: 需要安装 `chromadb`, `sqlite3`, `asyncio`, `playwright` (用于长图渲染)。
+
+---
+
+## 免责声明
+本插件生成的学术建议和认知报告仅供参考，不作为权威学术结论。请定期备份 `data/` 目录下的数据库文件以防数据意外丢失。
