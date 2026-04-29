@@ -3,4 +3,4 @@ display_name: OmniTutor # 用于展示的名字，可以是方便人类阅读的
 desc: 你的个性化全能导师。 # 插件简短描述
 version: v1.0 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: Falling-Star # 作者
-repo: https://github.com/Soulter/OmniTutor # 插件的仓库地址
+repo: https://github.com/Faling-Star/helloworld # 插件的仓库地址
