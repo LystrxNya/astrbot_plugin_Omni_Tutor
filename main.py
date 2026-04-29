@@ -18,8 +18,32 @@ from .core.tutor_brain import TutorBrain
 
 @register("omni_tutor", "YourName", "全知导师 - 终极认知版", "4.0.0")
 class OmniTutorPlugin(Star):
-    def __init__(self, context: Context, config: dict):
+    # ==========================================
+    # 🌟 绝杀补丁：声明一个类级别的静态缓存
+    # ==========================================
+    _cached_config = None 
+
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
+        
+        logger.warning(f"🚨 [OmniTutor 调试] 当前实例化收到的 config 类型: {type(config)}")
+        
+        # ==========================================
+        # 🌟 跨实例配置窃取与恢复术
+        # ==========================================
+        # 1. 如果框架很乖地传了真实配置，我们就把它“偷藏”到类的静态变量里
+        if config is not None:
+            OmniTutorPlugin._cached_config = config
+        
+        # 2. 如果框架“发神经”传了 None，我们就直接从缓存里掏出真实配置！
+        if config is None and OmniTutorPlugin._cached_config is not None:
+            config = OmniTutorPlugin._cached_config
+            logger.warning("🔧 [漏洞修补] 抓到框架漏传配置！已成功从类缓存中恢复真实的 API Key！")
+            
+        # 3. 终极兜底
+        if config is None:
+            config = {}
+        # ==========================================
         
         # 1. 基础与模型配置加载 (彻底解耦)
         # 做了兼容处理，防止新旧配置项键名不一致
@@ -30,12 +54,13 @@ class OmniTutorPlugin(Star):
         self.ocr_model = config.get("ocr_model", "qwen-vl-ocr-2025-11-20")
         self.vision_model = config.get("vision_model", "qwen-vl-max")
         # 🌟 核心替换：将原先的 assistant_model 升级为快慢双脑
-        self.fast_model = config.get("fast_model", "qwen-turbo")
-        self.reasoning_model = config.get("reasoning_model", "deepseek-v3")
+        self.fast_model = config.get("fast_model", "qwen-flash")
+        self.reasoning_model = config.get("reasoning_model", "qwen3.5-plus")
         self.embedding_model = config.get("embedding_model", "BAAI/bge-m3")
         self.rerank_model = config.get("rerank_model", "BAAI/bge-reranker-v2-m3")
         
         # 2. 状态队列初始化
+        self.enable_llm_cleanup = False # 🌟 全局默认关闭大模型洗稿，追求极致效率
         self.waiting_users = set()           # 主库录入
         self.important_waiting_users = set() # 独立库录入
         self.deep_read_waiting_users = set() # 精读模式
@@ -152,16 +177,23 @@ class OmniTutorPlugin(Star):
 
     @filter.command("ocr")
     async def manual_ocr_command(self, event: AstrMessageEvent):
-        """手动触发 OCR：进入防抖打包提取模式"""
-        if not self.brain or not hasattr(self.brain, 'ocr'):
-            yield event.plain_result("❌ OCR 引擎未初始化。")
+        """触发纯 OCR 提取模式"""
+        # 物理拦截，绝对不能让指令漏给大模型！
+        event.stop_event()
+        
+        # 检查引擎是否就绪
+        if not getattr(self, 'brain', None) or not getattr(self.brain, 'ocr', None):
+            yield event.plain_result("❌ 中枢大脑或 OCR 引擎未唤醒，请检查配置。")
             return
             
         uid = event.get_sender_id()
-        if not hasattr(self, 'ocr_waiting_users'): self.ocr_waiting_users = set()
+        
+        if not hasattr(self, 'ocr_waiting_users'):
+            self.ocr_waiting_users = set()
+            
         self.ocr_waiting_users.add(uid)
         
-        yield event.plain_result("🔎 [纯文本提取模式] 已就绪！\n👉 请直接发送需要提取的图片（支持连发多图，5秒内无新文件将自动打包提取）。")
+        yield event.plain_result("📸 视觉引擎已就绪！请在 5 秒内发送你需要提取的图片或PDF（支持多文件连发，将会自动去重拼接）。")
 
     @filter.regex(r".*")
     async def handle_waiting_file(self, event: AstrMessageEvent):
@@ -174,17 +206,18 @@ class OmniTutorPlugin(Star):
 
         plain_text = "".join([c.text for c in event.message_obj.message if isinstance(c, Comp.Plain)]).strip()
         
-        # 放行所有唤醒指令
-        if plain_text in ["/学习", "/重要录入", "/碎片录入", "/精读", "/ocr", "/提取文字"]: return
+        # 🌟 修复点 1：把新指令 /精细ocr 也加入免检通道放行
+        if plain_text in ["/学习", "/重要录入", "/碎片录入", "/精读", "/ocr", "/提取文字", "/精细ocr"]: return
 
         uid = event.get_sender_id()
         is_main = uid in getattr(self, 'waiting_users', set())
         is_miu = uid in getattr(self, 'important_waiting_users', set())
         is_reading = uid in getattr(self, 'deep_read_waiting_users', set())
         is_ocr = uid in getattr(self, 'ocr_waiting_users', set())
+        is_adv_ocr = uid in getattr(self, 'adv_ocr_waiting_users', set())
 
         # 如果不属于任何收集模式，立刻放行
-        if not any([is_main, is_miu, is_reading, is_ocr]): return 
+        if not any([is_main, is_miu, is_reading, is_ocr, is_adv_ocr]): return 
 
         # 如果在收集中途遇到其他指令，安全退出当前收集状态
         if plain_text.startswith("/"): 
@@ -192,6 +225,7 @@ class OmniTutorPlugin(Star):
             self.important_waiting_users.discard(uid)
             self.deep_read_waiting_users.discard(uid)
             if hasattr(self, 'ocr_waiting_users'): self.ocr_waiting_users.discard(uid)
+            if hasattr(self, 'adv_ocr_waiting_users'): self.adv_ocr_waiting_users.discard(uid)
             if uid in getattr(self, 'file_buffer', {}) and self.file_buffer[uid]['timer']:
                 self.file_buffer[uid]['timer'].cancel()
             self.file_buffer.pop(uid, None)
@@ -200,6 +234,7 @@ class OmniTutorPlugin(Star):
         # 确认是目标文件后，停止事件传播，防止大模型插嘴
         event.stop_event()
 
+        # 🌟 修复点 2：就是这句被误删了！把它加回来提取物理文件！
         files = await self._extract_files_info(event)
         
         if not hasattr(self, 'file_buffer'): self.file_buffer = {}
@@ -207,6 +242,7 @@ class OmniTutorPlugin(Star):
         # 🛒 初始化购物车
         if uid not in self.file_buffer:
             if is_reading: prefix = "📖 [深度精读]"
+            elif is_adv_ocr: prefix = "💎 [精细提取]"
             elif is_miu: prefix = "🌟 [独立重要库]"
             elif is_ocr: prefix = "🔎 [纯文本提取]"
             else: prefix = "🧠 [全知主库]"
@@ -217,7 +253,8 @@ class OmniTutorPlugin(Star):
                 'prefix': prefix,
                 'is_miu': is_miu,
                 'is_reading': is_reading,
-                'is_ocr': is_ocr
+                'is_ocr': is_ocr,
+                'is_adv_ocr': is_adv_ocr
             }
             await event.send(event.plain_result(f"⏳ 收到资料，正在等待后续文件... (5秒内无动作将自动打包处理)"))
 
@@ -231,7 +268,9 @@ class OmniTutorPlugin(Star):
         self.file_buffer[uid]['timer'] = asyncio.create_task(self._process_buffered_data(uid, event))
 
     async def _process_buffered_data(self, uid: str, event: AstrMessageEvent):
-        """倒计时结束后的终极处理分支"""
+        """倒计时结束后的终极处理分支 (大模型语义洗稿 + 双路由并发版 + 全链路中断截断)"""
+        import asyncio
+
         try: await asyncio.sleep(5)
         except asyncio.CancelledError: return
 
@@ -243,6 +282,7 @@ class OmniTutorPlugin(Star):
         getattr(self, 'important_waiting_users', set()).discard(uid)
         getattr(self, 'deep_read_waiting_users', set()).discard(uid)
         if hasattr(self, 'ocr_waiting_users'): self.ocr_waiting_users.discard(uid)
+        if hasattr(self, 'adv_ocr_waiting_users'): self.adv_ocr_waiting_users.discard(uid)
 
         files = data['files']
         text = "\n".join(data['text']).strip()
@@ -251,45 +291,118 @@ class OmniTutorPlugin(Star):
         is_miu = data['is_miu']
         is_reading = data['is_reading']
         is_ocr = data.get('is_ocr', False)
+        is_adv_ocr = data.get('is_adv_ocr', False)
+
+        llm_cleanup_flag = getattr(self, 'enable_llm_cleanup', False)
+
+        # ==========================================
+        # 🌟 核心中断探针：闭包函数透传给所有底层 API
+        # ==========================================
+        def check_abort():
+            return uid in self.aborted_users
 
         async def progress(msg): 
+            if check_abort(): return # 播报时顺便静音
             await event.send(event.plain_result(msg))
             await asyncio.sleep(0.6) 
 
         try:
             # ==========================================
-            # 🌟 分支 0：OCR 批量提取模式
+            # 分支 0：极简双路由提取模式 (OCR & 精细OCR)
             # ==========================================
-            if is_ocr:
+            if is_ocr or is_adv_ocr:
                 if not files:
-                    await progress("❌ 未检测到有效图片，文字提取已自动退出。")
+                    await progress("❌ 未检测到有效文件，文字提取已自动退出。")
                     return
-                await progress(f"{prefix} 收集完毕！正在启动高精度引擎批量扫描 {len(files)} 张图片...")
-                results = []
-                for idx, (target_path, file_name) in enumerate(files):
-                    try:
-                        extracted_text = await self.brain.ocr.process_file(target_path, 0, self.zoom, enable_vision=True) 
-                        if extracted_text:
-                            results.append(f"【图 {idx+1}】\n{extracted_text}")
-                        else:
-                            results.append(f"【图 {idx+1}】未能识别出有效文字。")
-                    except Exception as e:
-                        results.append(f"【图 {idx+1}】解析失败: {e}")
+                await progress(f"{prefix} 收集完毕！正在解析文件结构...")
                 
-                final_text = "\n\n".join(results)
-                # 如果附带了文字说明，也一并呈现在提取结果中
-                if text: final_text += f"\n\n【附加文本】：{text}"
+                sem = asyncio.Semaphore(3 if is_adv_ocr else 10)
                 
-                await event.send(event.plain_result(f"✅ 提取完成：\n\n{final_text}"))
+                async def process_single_page(global_idx, target_path, page_idx, file_name):
+                    if check_abort(): return global_idx, file_name, "" # 🌟 队列排队前拦截
+                    async with sem:
+                        if check_abort(): return global_idx, file_name, "" # 🌟 拿到底层锁后拦截
+                        try:
+                            extracted = await target_brain.ocr.process_file(target_path, page_idx, self.zoom, enable_vision=is_adv_ocr)
+                            return global_idx, file_name, extracted
+                        except Exception as e:
+                            return global_idx, file_name, ""
+                
+                tasks = []
+                global_task_idx = 0
+                
+                for target_path, file_name in files:
+                    ext = target_path.lower().split('.')[-1]
+                    if ext == 'pdf':
+                        try:
+                            import fitz
+                            doc = fitz.open(target_path)
+                            total_pages = doc.page_count
+                            doc.close()
+                        except:
+                            total_pages = 1
+                            
+                        for page_idx in range(total_pages):
+                            tasks.append(process_single_page(global_task_idx, target_path, page_idx, file_name))
+                            global_task_idx += 1
+                    else:
+                        tasks.append(process_single_page(global_task_idx, target_path, 0, file_name))
+                        global_task_idx += 1
+
+                await progress(f"🚀 正在启动提取引擎，并发扫描 {len(tasks)} 页内容...")
+                raw_results = await asyncio.gather(*tasks)
+                
+                if check_abort(): return # 🌟 扫描结束发现已被用户取消，直接丢弃结果并退出
+
+                raw_results.sort(key=lambda x: x[0])
+                
+                final_text = ""
+                for idx, file_name, ext_text in raw_results:
+                    if ext_text and ext_text.strip():
+                        final_text += f"\n\n--- [第 {idx+1} 页提取片段] ---\n\n{ext_text.strip()}"
+                
+                if not final_text.strip():
+                    await event.send(event.plain_result(f"❌ 提取失败：未能识别出有效文字。"))
+                    return
+
+                if is_ocr:
+                    if llm_cleanup_flag:
+                        await progress("🧠 粗提完成！快脑大模型已接管，正在进行全篇语义去重与重构...")
+                        if check_abort(): return # 🌟 
+                        final_text = await target_brain.clean_ocr_text_with_llm(final_text)
+                    else:
+                        await progress("⚡ 原生物理提取完成！(全局 LLM 修补功能当前为关闭状态)")
+
+                if check_abort(): return # 🌟 写文件前最后一道防线
+
+                if text: final_text = f"【附加文本】：{text}\n\n{final_text}"
+                
+                import os, uuid
+                import astrbot.core.message.components as Comp
+                out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "output")
+                os.makedirs(out_dir, exist_ok=True)
+                md_filename = f"ocr_result_{uuid.uuid4().hex[:6]}.md"
+                md_path = os.path.join(out_dir, md_filename)
+                
+                with open(md_path, "w", encoding="utf-8") as f: 
+                    f.write(final_text)
+                    
+                await progress(f"✅ 并发提取与排版清洗完成！长文本已为您打包为文件：")
+                await event.send(event.chain_result([Comp.File(file=md_path, name=md_filename)]))
                 return
 
             # ==========================================
-            # 🌟 分支 1：深度精读模式 (下发 MD 文件)
+            # 分支 1：深度精读模式
             # ==========================================
             if is_reading:
-                await progress(f"{prefix} 收到资料！准备启动百炼思考引擎进行重构...")
-                summary = await target_brain.deep_read_and_summarize(files, text, self.zoom, progress_callback=progress)
+                await progress(f"{prefix} 收到资料！准备启动思考引擎进行重构...")
+                summary = await target_brain.deep_read_and_summarize(files, text, self.zoom, progress_callback=progress, is_aborted=check_abort) # 🌟 传入探针
+                
+                if check_abort() or "🚫" in summary: return # 🌟 被阻断则直接退出
+
                 await progress(f"📝 思考与重构完毕！可琳正在为您生成详尽的 Markdown 笔记文件...")
+                import os, uuid
+                import astrbot.core.message.components as Comp
                 out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "output")
                 os.makedirs(out_dir, exist_ok=True)
                 md_filename = f"deepread_{uuid.uuid4().hex[:6]}.md"
@@ -299,35 +412,59 @@ class OmniTutorPlugin(Star):
                 return
 
             # ==========================================
-            # 🌟 分支 2：知识库录入模式
+            # 分支 2：知识库录入模式
             # ==========================================
             combined_ocr_text = "" 
             if files:
                 await progress(f"📦 收集完毕！共收到 {len(files)} 个文件，即将开启批量流水线...")
                 for target_path, file_name in files:
+                    if check_abort():
+                        await progress("🛑 检测到取消指令，已拦截后续文件的录入。")
+                        break # 🌟 立即中断后续文件的处理
+
                     await progress(f"{prefix} 正在深度解析 [{file_name}]...")
                     if is_miu:
-                        result = await target_brain.ingest_important_info(file_path=target_path, source_label=file_name, zoom=self.zoom, progress_callback=progress)
+                        result = await target_brain.ingest_important_info(
+                            file_path=target_path, source_label=file_name, zoom=self.zoom, 
+                            progress_callback=progress, enable_llm_cleanup=llm_cleanup_flag,
+                            is_aborted=check_abort # 🌟 传入探针
+                        )
                     else:
-                        result = await target_brain.learn_from_file(target_path, source_name=file_name, zoom=self.zoom, progress_callback=progress)
+                        result = await target_brain.learn_from_file(
+                            target_path, source_name=file_name, zoom=self.zoom, 
+                            progress_callback=progress, enable_llm_cleanup=llm_cleanup_flag,
+                            is_aborted=check_abort # 🌟 传入探针
+                        )
                         
+                    if check_abort(): break # 🌟 彻底防漏
+
                     res_msg = result[0] if isinstance(result, tuple) else str(result)
                     ocr_text = result[1] if isinstance(result, tuple) and len(result) > 1 else ""
-                    await progress(res_msg)
-                    if ocr_text: combined_ocr_text += f"\n\n# 【文件提取】{file_name}\n\n{ocr_text}"
-                if len(files) > 1:
+                    
+                    if "🚫" not in res_msg: # 只播报未被取消的任务
+                        await progress(res_msg)
+                        if ocr_text: combined_ocr_text += f"\n\n# 【文件提取】{file_name}\n\n{ocr_text}"
+                        
+                if len(files) > 1 and not check_abort():
                     await progress(f"🎉 批量录入完成，共完美处理了 {len(files)} 个文件！")
                     
             elif text and is_miu:
                 await progress(f"{prefix} 收集完毕，正在切割处理多段文字信息...")
-                result = await target_brain.ingest_important_info(raw_text=text, source_label="手动录入", progress_callback=progress)
-                res_msg = result[0] if isinstance(result, tuple) else str(result)
-                await progress(res_msg)
+                result = await target_brain.ingest_important_info(
+                    raw_text=text, source_label="手动录入", 
+                    progress_callback=progress, enable_llm_cleanup=llm_cleanup_flag,
+                    is_aborted=check_abort # 🌟 传入探针
+                )
+                if not check_abort():
+                    res_msg = result[0] if isinstance(result, tuple) else str(result)
+                    await progress(res_msg)
             else:
                 await progress("❌ 未检测到有效文件，录入模式已自动退出。")
                 return
 
-            if getattr(self, 'enable_md_reply', False) and combined_ocr_text.strip():
+            if getattr(self, 'enable_md_reply', False) and combined_ocr_text.strip() and not check_abort():
+                import os, uuid
+                import astrbot.core.message.components as Comp
                 out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "output")
                 os.makedirs(out_dir, exist_ok=True)
                 md_filename = f"ocr_batch_{uuid.uuid4().hex[:6]}.md"
@@ -338,8 +475,9 @@ class OmniTutorPlugin(Star):
         except Exception as e:
             import traceback
             print(f"[Process Error] {traceback.format_exc()}")
-            await event.send(event.plain_result(f"❌ 批量处理任务发生异常: {str(e)}"))
-
+            if not check_abort():
+                await event.send(event.plain_result(f"❌ 批量处理任务发生异常: {str(e)}")) 
+       
     @filter.command("取消")
     async def cancel_action(self, event: AstrMessageEvent):
         """紧急刹车：中止录入状态，并拦截大模型当前正在生成的对话回复"""
@@ -439,22 +577,28 @@ class OmniTutorPlugin(Star):
             self.aborted_users.discard(uid)
             
         current_query = event.message_str.strip()
-        files = await self._extract_files_info(event)
+        # 提取当前消息中的物理文件路径
+        files_info = await self._extract_files_info(event)
+        image_paths = [f[0] for f in files_info if f[1].lower().endswith(('.jpg', '.png', '.jpeg', '.webp'))]
 
-        vision_hint = ""
-        if files:
-            self._debug_log("👁️ 图像已进入主脑视觉处理通道。")
-            vision_hint = "\n(System: 用户发送了图片，请直接通过多模态视觉能力进行观察和解析。)\n"
+        if not current_query and not image_paths: return
 
-        if not current_query and not files: return
-
-        # 只要有文字，必然触发 RAG 检索 (现在图文缝合后一定有文字)
-        if current_query:
-            await event.send(event.plain_result("🔍 正在检索全知知识库与认知图谱..."))
+        if current_query or image_paths:
+            # 如果是纯图片提问，播报观察状态
+            await event.send(event.plain_result("🔍 正在观察题目并检索认知图谱..."))
+            
             try:
-                search_result = await self.brain.retrieve_knowledge(query=current_query, uid=uid, top_k=3)
+                # 🌟 透传图片路径给检索逻辑
+                search_result = await self.brain.retrieve_knowledge(
+                    query=current_query, 
+                    uid=uid, 
+                    top_k=3, 
+                    images=image_paths #
+                )
+                
+                # ... 注入人设与检索结果到系统提示词 ...
                 priority_instruction = (
-                    f"\n\n[SYSTEM INSTRUCTION: 专属记忆回放与最高优先级约束]{vision_hint}\n"
+                    f"\n\n[SYSTEM INSTRUCTION: 专属记忆回放与最高优先级约束]\n"
                     "【人格铁律】：请绝对保持你【治愈系女仆导师·可琳】的核心设定。严禁使用干巴巴的机械列表！\n"
                     "【知识采信铁律】：以下是从【专属私有记忆】中检索到的资料。你必须优先、深度依赖以下内容进行解答！\n"
                     "--- 专属私有记忆检索结果 ---\n"
@@ -462,8 +606,6 @@ class OmniTutorPlugin(Star):
                 req.system_prompt = (req.system_prompt or "") + priority_instruction + search_result
             except Exception as e:
                 self._debug_log(f"❌ 检索拦截崩溃: {e}")
-        else:
-            req.system_prompt = (req.system_prompt or "") + f"\n\n[SYSTEM INSTRUCTION]\n保持【治愈系女仆导师·可琳】人格。{vision_hint}"
 
     @filter.on_llm_response()
     async def render_llm_response(self, event: AstrMessageEvent, resp):
@@ -671,7 +813,7 @@ class OmniTutorPlugin(Star):
             yield event.plain_result(res)
 
 
-    @filter.command("存入")
+    @filter.command("记住")
     async def save_last_reply(self, event: AstrMessageEvent, *, instruction: str = ""):
         if not self.brain: return
         last_text = self.last_responses.get(event.get_sender_id())
@@ -713,17 +855,41 @@ class OmniTutorPlugin(Star):
         else: yield event.plain_result(md_text)
 
     @filter.command("图谱")
-    async def knowledge_tree(self, event: AstrMessageEvent):
-        """🌟 全面适配新扁平化概念池"""
+    async def knowledge_tree(self, event: AstrMessageEvent, *, target: str = ""):
+        """🌟 全面适配新扁平化概念池，支持指令：/图谱 [可选文件名]"""
         if not self.brain: return
-        concepts = self.brain.sql_manager.get_all_knowledge_concepts()
-        if not concepts: yield event.plain_result("🌳 当前概念池为空。"); return
+        
+        # ==========================================
+        # 🌟 1. 路由分发：查全库 vs 查单文件
+        # ==========================================
+        if target:
+            # 调用大脑的方法去捞单个文件的数据
+            res = self.brain.get_file_concepts(target)
+            if isinstance(res, str): # 如果返回的是字符串，说明是报错或没找到文件
+                yield event.plain_result(res)
+                return
+            exact_name, concepts = res
+            title_prefix = f"📄 [{exact_name}] 专属图谱"
+            loading_msg = f"🎨 正在为您渲染文件 [{exact_name}] 包含的"
+        else:
+            concepts = self.brain.sql_manager.get_all_knowledge_concepts()
+            title_prefix = "🌳 扁平化概念图谱概览"
+            loading_msg = "🎨 正在为您渲染全库包含"
+
+        if not concepts: 
+            yield event.plain_result(f"📭 {'该文件尚未提取到任何' if target else '当前'}概念池为空。")
+            return
             
+        # ==========================================
+        # 🌟 2. 统计与组装数据
+        # ==========================================
+        total_tags = len(concepts)
         tree_dict = {}
+        
         for node in concepts:
-            course = node['course']
-            concept = node['concept']
-            freq = node['frequency']
+            course = node.get('course', '通用')
+            concept = node.get('concept', '未知概念')
+            freq = node.get('frequency', 1)
             
             hot_icon = "🔥🔥🔥" if freq >= 10 else "🔥🔥" if freq >= 5 else "🔥" if freq >= 2 else "🧊"
             display = f"{concept} {hot_icon} *(频次: {freq})*"
@@ -731,17 +897,24 @@ class OmniTutorPlugin(Star):
             if course not in tree_dict: tree_dict[course] = []
             tree_dict[course].append((freq, display))
             
-        md_text = "# 🌳 扁平化概念图谱概览\n\n"
+        # ==========================================
+        # 🌟 3. 拼接 Markdown 与渲染
+        # ==========================================
+        md_text = f"# {title_prefix} (共 {total_tags} 个节点)\n\n"
         for course, c_list in tree_dict.items():
             md_text += f"## 📘 {course}\n"
             c_list.sort(key=lambda x: x[0], reverse=True)
-            # 限制每个学科只显示前30个高频词
+            # 限制每个学科只显示前100个高频词
             md_text += f"- **核心概念**: {', '.join([item[1] for item in c_list[:100]])}\n"
                 
-        yield event.plain_result("🎨 正在渲染概念网络...")
+        yield event.plain_result(f"{loading_msg} {total_tags} 个节点的概念网络，请稍候...")
         success, result = await self.renderer.render_to_image(md_text)
-        if success: await event.send(event.chain_result([Comp.Image(file=result)]))
-        else: yield event.plain_result(md_text)
+        
+        if success: 
+            import astrbot.core.message.components as Comp
+            await event.send(event.chain_result([Comp.Image(file=result)]))
+        else: 
+            yield event.plain_result(md_text)
 
     @filter.command("清空主库")
     async def clear_brain(self, event: AstrMessageEvent):
@@ -816,8 +989,14 @@ class OmniTutorPlugin(Star):
     async def delete_kb_node(self, event: AstrMessageEvent, *, node_name: str = ""):
         if not self.brain: return
         if not node_name: yield event.plain_result("⚠️ 请输入概念名称。"); return
+    
         count = self.brain.sql_manager.delete_concept_by_name(node_name)
-        yield event.plain_result(f"✅ 已删除概念：【{node_name}】" if count > 0 else "❌ 未找到该概念。")
+        if count > 0:
+        # 🌟 必须补上 ChromaDB 的标签向量同步删除！
+            self.brain.vector_store.delete_tags([node_name])
+            yield event.plain_result(f"✅ 已彻底抹除图谱概念：【{node_name}】及其所有映射关系。")
+        else:
+            yield event.plain_result("❌ 未找到该概念。")
 
     @filter.command("重置节点")
     async def reset_kb_mastery(self, event: AstrMessageEvent, *, node_name: str = ""):
@@ -879,21 +1058,26 @@ class OmniTutorPlugin(Star):
             yield event.plain_result(f"❌ 撤销失败: {e}")
 
     @filter.command("自清洗")
-    async def manual_clean_graph(self, event: AstrMessageEvent):
-        """手动触发全库图谱清洗与坍缩"""
+    async def manual_clean_graph(self, event: AstrMessageEvent, *, target: str = ""):
+        """手动触发图谱清洗与坍缩。/自清洗 [文件名] 可靶向清洗指定文件，不填则清洗全库"""
         if not self.brain: 
             yield event.plain_result("❌ 导师大脑未唤醒。")
             return
             
-        yield event.plain_result("🚀 收到指令！正在为全知主库启动【深度自清洗】流水线，这可能需要一些时间，请稍候...")
-        
         # 封装一个实时的进度播报回调
         async def progress(text):
             await event.send(event.plain_result(text))
             
         try:
-            # 呼叫大脑执行全库深层清洗
-            result_msg = await self.brain.clean_entire_graph(progress_callback=progress)
+            if target:
+                yield event.plain_result(f"🚀 收到指令！正在为文件【{target}】启动【专属自清洗】流水线，请稍候...")
+                # 呼叫大脑执行单文件清洗
+                result_msg = await self.brain.clean_file_graph(target, progress_callback=progress)
+            else:
+                yield event.plain_result("🚀 收到指令！正在为全知主库启动【深度自清洗】流水线，这可能需要一些时间，请稍候...")
+                # 呼叫大脑执行全库深层清洗
+                result_msg = await self.brain.clean_entire_graph(progress_callback=progress)
+                
             yield event.plain_result(result_msg)
         except Exception as e:
             yield event.plain_result(f"❌ 清洗任务崩溃: {e}")
@@ -922,3 +1106,13 @@ class OmniTutorPlugin(Star):
         async def progress(t): await event.send(event.plain_result(t))
         res = await self.brain.reprocess_unsuitable_concept(name, progress_callback=progress)
         yield event.plain_result(res)
+
+    @filter.command("llm修补")
+    async def toggle_llm_cleanup(self, event: AstrMessageEvent):
+        """全局切换是否开启 OCR 提取后的大模型洗稿去重"""
+        self.enable_llm_cleanup = not getattr(self, 'enable_llm_cleanup', False)
+        if self.enable_llm_cleanup:
+            status = "🟢 已开启 (警告：处理时间变长，但去重排版极佳)"
+        else:
+            status = "🔴 已关闭 (当前为极速原生提取，原汁原味不过滤)"
+        yield event.plain_result(f"⚙️ 全局 LLM 洗稿状态：{status}")

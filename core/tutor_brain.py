@@ -26,8 +26,8 @@ class TutorBrain:
     def __init__(self, dashscope_key: str, siliconflow_key: str, 
                  ocr_model: str = "qwen-vl-ocr-2025-11-20", 
                  vision_model: str = "qwen-vl-max", 
-                 fast_model: str = "qwen-plus",            # 快脑
-                 reasoning_model: str = "deepseek-v3",     # 慢脑
+                 fast_model: str = "qwen-flash",            # 快脑
+                 reasoning_model: str = "qwen3.5-plus",     # 慢脑
                  embedding_model: str = "BAAI/bge-m3",                
                  rerank_model: str = "BAAI/bge-reranker-v2-m3",
                  persist_dir: str = "data/omnitutor_vdb", 
@@ -39,7 +39,8 @@ class TutorBrain:
         print(f"[TutorBrain] 🧠 正在启动中枢系统 (VDB: {persist_dir})...")
         
         self.siliconflow_key = siliconflow_key
-        
+        self.dashscope_key = dashscope_key  # 🌟 补上这行，让大模型洗稿函数能拿到 Key！
+
         # 将模型配置精细分发给底层引擎
         self.ocr = QwenOCREngine(api_key=dashscope_key, ocr_model=ocr_model, vision_model=vision_model)
         self.embedder = SiliconFlowEmbedder(api_key=siliconflow_key, embedding_model=embedding_model, rerank_model=rerank_model)
@@ -49,12 +50,34 @@ class TutorBrain:
         self.tagger = ConceptTagger(
             dashscope_key=dashscope_key, 
             fast_model=fast_model, 
-            reasoning_model=reasoning_model
+            reasoning_model=reasoning_model,
+            vision_model=vision_model
         )
         
         # 存储中枢 (双集合 ChromaDB + 倒排索引 SQLite)
         self.vector_store = VectorStore(persist_dir=persist_dir)
         self.sql_manager = SQLiteManager(db_path=db_path)
+
+        # =========================================================================
+        # 🌟 终极提速补丁：挂载全局内存级向量缓存 (In-Memory Cache) 斩断 O(N²) 风暴
+        # =========================================================================
+        self.embedder._emb_cache = {}
+        _original_get_embeddings = self.embedder.get_embeddings
+
+        async def _cached_get_embeddings(texts: list) -> list:
+            """无缝接管的带缓存向量获取器"""
+            # 区分出哪些词是没算过的
+            uncached_texts = [t for t in texts if t not in self.embedder._emb_cache]
+            if uncached_texts:
+                # 只有遇到没见过的词，才发起昂贵的网络请求
+                new_embs = await _original_get_embeddings(uncached_texts)
+                for t, e in zip(uncached_texts, new_embs):
+                    self.embedder._emb_cache[t] = e
+            # 无论如何，最终都从内存(纳秒级)里按原顺序组装返回
+            return [self.embedder._emb_cache[t] for t in texts]
+
+        # 劫持底层方法，整个框架（包括 tagger）在不知情的情况下享受到缓存加速
+        self.embedder.get_embeddings = _cached_get_embeddings
 
         print(f"  ├── 👁️  双核视觉引擎: {ocr_model} + {vision_model} [就绪]")
         print(f"  ├── 🧬 向量与重排引擎: {embedding_model} + {rerank_model} [就绪]")
@@ -67,14 +90,59 @@ class TutorBrain:
     # 🌟 深度精读与思考闭环流水线
     # =========================================================================
 
-    async def deep_read_and_summarize(self, files: list, raw_text: str, zoom: float = 3.0, progress_callback=None) -> str:
+    async def deep_read_and_summarize(self, files: list, raw_text: str, zoom: float = 3.0, progress_callback=None, is_aborted=None) -> str:
         """多文件解析提取 -> 思考引擎深度总结"""
+        import re
+        import difflib
+        
+        def _merge_ppt_ocr_texts(text1, text2):
+            # ... 此处不改，保留你之前的函数体逻辑 ...
+            if not text1: return text2
+            if not text2: return text1
+            def clean(t): return re.sub(r'\s+', '', t)
+            c1, c2 = clean(text1), clean(text2)
+            if not c1 or not c2: return text1 + "\n\n" + text2
+
+            sm = difflib.SequenceMatcher(None, c1, c2)
+            match = sm.find_longest_match(0, len(c1), 0, len(c2))
+            if match.size > 0:
+                if match.size / len(c1) > 0.85: return text2
+                if match.size / len(c2) > 0.85: return text1
+
+            best_i = -1
+            max_match_len = 0
+            search_c1 = c1[-800:] if len(c1) > 800 else c1
+            search_c2 = c2[:800] if len(c2) > 800 else c2
+
+            for i in range(len(search_c1)):
+                suffix = search_c1[i:]
+                if len(suffix) < 10: break
+                prefix = search_c2[:len(suffix)]
+                sm2 = difflib.SequenceMatcher(None, suffix, prefix)
+                if sm2.ratio() > 0.85 and len(suffix) > max_match_len:
+                    max_match_len = len(suffix)
+                    best_i = i
+
+            if max_match_len > 0:
+                overlap_start_c1 = len(c1) - len(search_c1) + best_i
+                clean_idx = 0
+                cut_point = len(text1)
+                for idx, char in enumerate(text1):
+                    if not re.match(r'\s', char):
+                        if clean_idx == overlap_start_c1:
+                            cut_point = idx
+                            break
+                        clean_idx += 1
+                return text1[:cut_point].rstrip() + "\n" + text2
+            return text1 + "\n\n" + text2
+
         async def notify(msg):
             if progress_callback: await progress_callback(msg)
 
         combined_text = raw_text + "\n"
         
         for file_path, file_name in files:
+            if is_aborted and is_aborted(): return "🚫 精读任务已被取消。" # 🌟
             ext = file_path.lower().split('.')[-1]
             await notify(f"👁️ 可琳正在通读 [{file_name}] 的每一行字...")
             
@@ -83,16 +151,33 @@ class TutorBrain:
                 total_pages = 1
                 if is_pdf:
                     doc = fitz.open(file_path)
-                    total_pages = min(len(doc), 15) # 限制精读页数防止超限
+                    total_pages = min(len(doc), 15) 
                     doc.close()
                 
-                for i in range(total_pages):
-                    page_text = await self.ocr.process_file(file_path, page_num=i, zoom=zoom, enable_vision=False)
-                    combined_text += f"\n{page_text}"
+                ocr_sem = asyncio.Semaphore(10)
+                async def fetch_page_ocr(page_idx):
+                    if is_aborted and is_aborted(): return page_idx, "" # 🌟
+                    async with ocr_sem:
+                        if is_aborted and is_aborted(): return page_idx, "" # 🌟
+                        return page_idx, await self.ocr.process_file(file_path, page_num=page_idx, zoom=zoom, enable_vision=False)
+                
+                tasks = [fetch_page_ocr(i) for i in range(total_pages)]
+                pages_results = await asyncio.gather(*tasks)
+                pages_results.sort(key=lambda x: x[0])
+                
+                if is_aborted and is_aborted(): return "🚫 精读任务已被取消。" # 🌟
+                
+                file_text = ""
+                for idx, page_text in pages_results:
+                    if page_text:
+                        file_text = _merge_ppt_ocr_texts(file_text, page_text)
+                        
+                combined_text += f"\n{file_text}"
             else:
                 text = await asyncio.to_thread(parse_office_file, file_path, ext)
                 combined_text += f"\n{text}"
                 
+        if is_aborted and is_aborted(): return "🚫 精读任务已被取消。" # 🌟 核心拦截
         if not combined_text.strip():
             return "⚠️ 资料里好像没有可以提取的有效文字呢..."
             
@@ -104,7 +189,7 @@ class TutorBrain:
     # 🌟 核心检索：双路召回 (Dual-Route Retrieval) + 倒排图谱路由
     # =========================================================================
 
-    async def retrieve_knowledge(self, query: str, uid: str, top_k: int = 5) -> str:
+    async def retrieve_knowledge(self, query: str, uid: str, top_k: int = 5, images: List[str] = None) -> str:
         """
         新纪元检索流：意图裂变 -> 标签向量池秒寻 -> 第一路图谱召回 -> 第二路语义盲捞 -> 智能安全截断 -> 重排缝合
         """
@@ -115,8 +200,8 @@ class TutorBrain:
             all_recall_results = []
             seen_ids = set()
 
-            # 🌟 步 1: 慢脑动态意图裂变 (裂变出可能的 Concepts 和 Pedagogy Type)
-            intents = await self.tagger.analyze_multi_intent(query)
+            # 1. 意图裂变（此时已具备视觉）
+            intents = await self.tagger.analyze_multi_intent(query, images=images)
             
             # 🌟 步 2: 第一路召回 (图谱路由 - 核心：由于这是一个 Concept 集合，往往会召回大量切片)
             if intents:
@@ -244,14 +329,23 @@ class TutorBrain:
             existing_courses = self.sql_manager.get_all_unique_courses()
             existing_concepts = self.sql_manager.get_all_unique_concepts()
             
+            # ==========================================
+            # 🌟 核心修复点 (Bug 2): 物理隔离
+            # 从现有的概念池中，将刚刚入库的“新词”剔除掉！
+            # 这样就能彻底防止大模型拿着新词去和自己计算相似度从而得出 1.0 的死锁。
+            # ==========================================
+            base_courses = list(set(existing_courses) - set(new_courses))
+            base_concepts = list(set(existing_concepts) - set(new_concepts))
+            
+            # 🌟 传入剔除自身后的 base_courses 和 base_concepts 作为参照物
             course_map = await self.tagger.cluster_words(
-                list(new_courses), existing_courses, self.embedder, 
-                direct_threshold=0.95, ai_threshold=0.90
+                list(new_courses), base_courses, self.embedder, 
+                direct_threshold=0.95, ai_threshold=0.80 
             )
             
             concept_map = await self.tagger.cluster_words(
-                list(new_concepts), existing_concepts, self.embedder, 
-                direct_threshold=0.92, ai_threshold=0.80
+                list(new_concepts), base_concepts, self.embedder, 
+                direct_threshold=0.92, ai_threshold=0.65 
             )
 
             course_map = {k: v for k, v in course_map.items() if k != v}
@@ -263,6 +357,7 @@ class TutorBrain:
             
             merged_count = len(course_map) + len(concept_map)
             if merged_count > 0:
+                from astrbot.api.all import logger
                 logger.info(f"🎉 [OmniTutor-洗牌] 后台图谱归一化完成！合并了 {merged_count} 个概念。从向量图谱摘除了 {vdb_updated} 个废弃节点。")
                 if callback:
                     await callback(
@@ -270,13 +365,21 @@ class TutorBrain:
                         f"可琳已将 {merged_count} 个同义词合并！图谱网络更加纯净了呢~"
                     )
             else:
+                from astrbot.api.all import logger
                 logger.info(f"♻️ [OmniTutor-洗牌] 后台图谱检查完毕，本次无新概念合并。")
         except Exception as e:
             import traceback
+            from astrbot.api.all import logger
             logger.error(f"❌ [后台洗牌异常] {traceback.format_exc()}")
 
-    async def learn_from_file(self, file_path: str, source_name: str, zoom: float = 3.0, progress_callback=None) -> Tuple[str, str]:
-        """全模态流式极速录入流水线"""
+    async def learn_from_file(self, file_path: str, source_name: str, zoom: float = 3.0, progress_callback=None, enable_llm_cleanup: bool = False, is_aborted=None) -> Tuple[str, str]:
+        """全模态流式极速录入流水线 (满血 10 并发 + 可选 LLM 洗稿版)"""
+        import uuid
+        import time
+        import asyncio
+        import fitz
+        from astrbot.api.all import logger
+
         start_time = time.time()
         logger.info(f"[TutorBrain] 📚 开始流式研读与分轨入库: [{source_name}]")
         
@@ -289,8 +392,8 @@ class TutorBrain:
             visual_exts = ['pdf', 'jpg', 'jpeg', 'png', 'bmp', 'webp']
             office_exts = ['txt', 'md', 'csv', 'xlsx', 'xls', 'docx', 'pptx']
             
-            # ================= 1. 物理切片提取 =================
-            if ext in visual_exts or ext == 'pdf':
+            # ================= 1. 物理提取与快脑清洗 =================
+            if ext in visual_exts:
                 is_pdf = ext == 'pdf'
                 total_pages = 1
                 if is_pdf:
@@ -298,45 +401,82 @@ class TutorBrain:
                     total_pages = len(pdf_doc)
                     pdf_doc.close()
                 
-                await notify(f"👁️ 正在启动多线程视觉引擎识别 ({total_pages} 页)...")
-                ocr_sem = asyncio.Semaphore(3)
+                await notify(f"👁️ 正在启动多线程视觉引擎并发识别 ({total_pages} 页)...")
+                
+                ocr_sem = asyncio.Semaphore(10)
                 
                 async def fetch_page_ocr(page_idx):
-                    await asyncio.sleep(0.1 * (page_idx % 3)) 
+                    if is_aborted and is_aborted(): return page_idx, "" # 🌟 拦截点1
                     async with ocr_sem:
+                        if is_aborted and is_aborted(): return page_idx, "" # 🌟 拦截点2
                         return page_idx, await self.ocr.process_file(file_path, page_num=page_idx, zoom=zoom, enable_vision=False)
                 
                 ocr_tasks = [fetch_page_ocr(i) for i in range(total_pages)]
                 pages_results = await asyncio.gather(*ocr_tasks)
+                
+                if is_aborted and is_aborted(): return "🚫 录入已被手动中止。", "" # 🌟 拦截点3
                 pages_results.sort(key=lambda x: x[0])
 
-                current_cache = ""
+                raw_pieces = []
                 for idx, page_text in pages_results:
-                    if not page_text: continue
-                    if not current_cache: current_cache = page_text; continue
-                        
-                    if current_cache in page_text: current_cache = page_text
-                    elif page_text in current_cache: continue
+                    if page_text and page_text.strip():
+                        raw_pieces.append(f"\n\n--- [第 {idx+1} 页提取片段] ---\n\n{page_text.strip()}")
+                
+                raw_combined = "".join(raw_pieces)
+                
+                if raw_combined.strip():
+                    if enable_llm_cleanup: 
+                        await notify("🧠 粗提完成！快脑 Qwen 已接管，正在进行全篇语义去重与格式重构...")
+                        full_markdown_text = await self.clean_ocr_text_with_llm(raw_combined)
                     else:
-                        if SequenceMatcher(None, current_cache, page_text).ratio() > 0.85:
-                            if len(page_text) > len(current_cache): current_cache = page_text
-                        else:
-                            full_markdown_text += "\n\n" + current_cache
-                            current_cache = page_text
-                if current_cache: full_markdown_text += "\n\n" + current_cache
+                        full_markdown_text = raw_combined
+                else:
+                    full_markdown_text = ""
 
             elif ext in office_exts:
                 await notify(f"📄 正在解析 Office 文档...")
                 full_markdown_text = await asyncio.to_thread(parse_office_file, file_path, ext)
 
+            if is_aborted and is_aborted(): return "🚫 录入已被手动中止。", "" # 🌟 拦截点4
+
             if not full_markdown_text.strip():
                 return f"❌ 研读失败：未能在 [{source_name}] 中识别到有效内容。", ""
 
-            chunks_dict_list = self.processor.process(full_markdown_text)
+            # =========================================================
+            # 🌟 新增：慢脑工程级动态切片探视 (Dynamic Chunking)
+            # =========================================================
+            import random
+            dynamic_chunk = 800
+            dynamic_overlap = 150
+            
+            if len(full_markdown_text) > 1200:
+                await notify("📐 正在呼叫慢脑进行工程级探视，推演动态切片策略...")
+                
+                # 随机抽取两段 400 字符的内容（确保拉开首尾差距，体现整体风格）
+                text_len = len(full_markdown_text)
+                idx1 = random.randint(0, text_len // 2 - 400)
+                idx2 = random.randint(text_len // 2, text_len - 400)
+                sample_text = f"【片段 A】\n{full_markdown_text[idx1:idx1+400]}\n\n【片段 B】\n{full_markdown_text[idx2:idx2+400]}"
+                
+                strategy = await self.tagger.analyze_chunk_strategy(sample_text)
+                
+                # 提取参数并加上防抖（防止大模型发癫给出极端数值）
+                raw_chunk = strategy.get("chunk_size", 800)
+                raw_overlap = strategy.get("overlap_size", 150)
+                reason = strategy.get("reason", "标准文献")
+                
+                dynamic_chunk = max(400, min(1500, int(raw_chunk)))
+                dynamic_overlap = max(50, min(300, int(raw_overlap)))
+                
+                await notify(f"📏 策略推演完成！\n💡 探视结论：{reason}\n⚙️ 参数调整为：Chunk={dynamic_chunk}, Overlap={dynamic_overlap}")
+
+            # 🌟 将动态参数喂给物理切片引擎
+            chunks_dict_list = self.processor.process(full_markdown_text, dynamic_chunk_size=dynamic_chunk, dynamic_overlap_size=dynamic_overlap)
+            
             pure_texts = [c["text"] for c in chunks_dict_list]
             chunk_ids = [uuid.uuid4().hex for _ in pure_texts]
             
-            await notify(f"✂️ 物理分块完成，共计 {len(pure_texts)} 个片段。")
+            await notify(f"✂️ 物理切片完毕，共计提纯 {len(pure_texts)} 个独立知识块。")
 
             # ================= 2. 极速提取原生标签 =================
             await notify(f"🏷️ 正在开启满血并发打标，提取原生概念...")
@@ -348,13 +488,18 @@ class TutorBrain:
             tag_sem = asyncio.Semaphore(200)
 
             async def process_single_chunk(text_chunk):
+                if is_aborted and is_aborted(): return None # 🌟 拦截点5
                 async with tag_sem:
+                    if is_aborted and is_aborted(): return None
                     return await self.tagger.extract_chunk_tags(text_chunk)
 
             tasks = [process_single_chunk(t) for t in pure_texts]
             raw_data_list = await asyncio.gather(*tasks)
 
+            if is_aborted and is_aborted(): return "🚫 录入已被手动中止。", "" # 🌟 拦截点6 (最关键：阻断落盘)
+
             for text, raw_data in zip(pure_texts, raw_data_list):
+                if not raw_data: continue # 跳过被中止的任务
                 course = raw_data.get("tags", {}).get("course", "通用")
                 concepts = raw_data.get("tags", {}).get("concepts", [])
 
@@ -367,39 +512,35 @@ class TutorBrain:
                 raw_data["text"] = text
                 final_chunks_data.append(raw_data)
             
-            logger.info(f" ├── 🏷️ 打标完成！处理了 {len(pure_texts)} 个文本块！收集到 {len(new_concepts_set)} 个新概念。")
+            logger.info(f"  ├── 🏷️ 打标完成！处理了 {len(pure_texts)} 个文本块！收集到 {len(new_concepts_set)} 个新概念。")
         
-            # ================= 3. 双轨落盘分离 (图谱与切片) =================
+            # ================= 3. 双轨落盘分离 =================
             await notify(f"🧬 标签提取完成，正在生成向量池并建立倒排索引...")
             
-            # 3.1 独立写入 Tags 向量池
             if new_concepts_set:
                 tags_list = list(new_concepts_set)
                 tag_embeddings = await self.embedder.get_embeddings(tags_list)
                 self.vector_store.add_tags(tags_list, tag_embeddings)
 
-            # 3.2 独立写入 Chunk 文本向量池
             embeddings = await self.embedder.get_embeddings(pure_texts)
             self.vector_store.add_chunks(final_chunks_data, source_name, chunk_ids, embeddings)
-            
-            # 3.3 写入 SQLite 关系库，自动建立多对多桥梁映射
             self.sql_manager.save_document(source_name, full_markdown_text, final_chunks_data, chunk_ids)
 
             # ================= 4. 启动后台异步清洗任务 =================
             asyncio.create_task(self._run_background_normalization(new_courses_set, new_concepts_set, progress_callback))
             
             cost = round(time.time() - start_time, 1)
-            msg = (
+            return (
                 f"✅ 资料已极速物理入库！\n"
                 f"📄 来源：{source_name}\n"
                 f"🎯 提炼切片：{len(final_chunks_data)} 个\n"
                 f"⏱️ 耗时：{cost} 秒\n\n"
                 f"(可琳正在后台为您洗牌与归一化，您可以继续发送下一份资料啦~)"
-            )
-            return msg, full_markdown_text
+            ), full_markdown_text
 
         except Exception as e:
             import traceback
+            from astrbot.api.all import logger
             logger.error(f"[TutorBrain Error] {traceback.format_exc()}")
             return f"❌ 学习失败: {str(e)}", ""
 
@@ -467,8 +608,14 @@ class TutorBrain:
     # 副脑 MIU 碎片操作
     # =========================================================================
 
-    async def ingest_important_info(self, raw_text: str = "", file_path: str = "", source_label: str = "手动录入", zoom: float = 3.0, progress_callback=None) -> Tuple[str, str]:
-        """极速碎片化录入"""
+    async def ingest_important_info(self, raw_text: str = "", file_path: str = "", source_label: str = "手动录入", zoom: float = 3.0, progress_callback=None, enable_llm_cleanup: bool = False, is_aborted=None) -> Tuple[str, str]:
+        import uuid
+        import time
+        import asyncio
+        import fitz
+        from datetime import datetime
+        from astrbot.api.all import logger
+
         start_time = time.time()
         async def notify(msg):
             if progress_callback: await progress_callback(msg)
@@ -478,17 +625,53 @@ class TutorBrain:
             if file_path:
                 ext = file_path.lower().split('.')[-1]
                 if ext in ['pdf', 'jpg', 'jpeg', 'png', 'bmp', 'webp']:
-                    await notify(f"👁️ 正在启动视觉引擎识别文件...")
-                    full_text = await self.ocr.process_file(file_path, page_num=0, zoom=zoom, enable_vision=False)
+                    await notify(f"👁️ 正在启动视觉引擎并发识别碎片文件...")
+                    
+                    is_pdf = ext == 'pdf'
+                    total_pages = 1
+                    if is_pdf:
+                        doc = fitz.open(file_path)
+                        total_pages = min(len(doc), 10) 
+                        doc.close()
+                    
+                    ocr_sem = asyncio.Semaphore(10)
+                    async def fetch_page_ocr(page_idx):
+                        if is_aborted and is_aborted(): return page_idx, "" # 🌟 拦截点
+                        async with ocr_sem:
+                            if is_aborted and is_aborted(): return page_idx, "" # 🌟 拦截点
+                            return page_idx, await self.ocr.process_file(file_path, page_num=page_idx, zoom=zoom, enable_vision=False)
+                    
+                    tasks = [fetch_page_ocr(i) for i in range(total_pages)]
+                    pages_results = await asyncio.gather(*tasks)
+                    
+                    if is_aborted and is_aborted(): return "🚫 碎片录入已被手动中止。", "" # 🌟
+                    pages_results.sort(key=lambda x: x[0])
+                    
+                    raw_pieces = []
+                    for idx, page_text in pages_results:
+                        if page_text and page_text.strip():
+                            raw_pieces.append(f"\n\n--- [第 {idx+1} 页提取片段] ---\n\n{page_text.strip()}")
+                    
+                    raw_combined = "".join(raw_pieces)
+                    if raw_combined.strip():
+                        if enable_llm_cleanup: 
+                            await notify("🧠 粗提完成！快脑大模型正在接管...")
+                            full_text = await self.clean_ocr_text_with_llm(raw_combined)
+                        else:
+                            full_text = raw_combined 
+                    else:
+                        full_text = ""
                 else:
                     await notify(f"📄 正在解析办公文档...")
                     full_text = await asyncio.to_thread(parse_office_file, file_path, ext)
                     
+            if is_aborted and is_aborted(): return "🚫 碎片录入已被手动中止。", "" # 🌟
             if not full_text.strip(): return "⚠️ 未能提取到有效文本内容。",""
 
-            await notify("✂️ 助理模型正在提取最小信息单元 (MIU) 并生成概括条目...")
+            await notify("✂️ 助理模型正在提取最小信息单元 (MIU)...")
             mius = await self.tagger.extract_miu(full_text)
             
+            if is_aborted and is_aborted(): return "🚫 碎片录入已被手动中止。", "" # 🌟
             if not mius: return "⚠️ 模型未能成功提取出任何信息单元。",""
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -501,17 +684,19 @@ class TutorBrain:
             await notify(f"🧬 正在对 {len(titles)} 个条目进行高纯度语义向量化...")
             embeddings = await self.embedder.get_embeddings(titles)
             
+            if is_aborted and is_aborted(): return "🚫 碎片落盘已被手动中止。", "" # 🌟 阻止落盘
+            
             mock_chunks = [{"text": t, "tags": {}, "pedagogy": {}, "boundary": {}} for t in titles]
             self.vector_store.add_chunks(mock_chunks, source_name, chunk_ids, embeddings)
             
             for cid, title, content in zip(chunk_ids, titles, contents):
                 self.sql_manager.save_important_miu(cid, title, content, source_name)
-                logger.info(f"  ├── 📦 已落盘碎片: [{title}]")
 
             cost = round(time.time() - start_time, 1)
             return f"✅ 碎片化内化完毕！\n🎯 提炼条目：{len(titles)} 个\n⏱️ 耗时：{cost}s", full_text
             
         except Exception as e:
+            from astrbot.api.all import logger
             logger.error(f"❌ 碎片入库失败: {e}")
             return f"❌ 碎片入库失败: {e}", ""
 
@@ -645,21 +830,22 @@ class TutorBrain:
                     continue
                 
                 # 拿着这一个词，去和目前已经确立的新基准比较
+                # 🌟 有了内存缓存加持，这里的 current_base 不管膨胀到多大，几乎都是 0 耗时！
                 cmap = await self.tagger.cluster_words(
                     [c], current_base, self.embedder, 
-                    direct_threshold=0.92, ai_threshold=0.80
+                    direct_threshold=0.92, ai_threshold=0.65 # 🌟 概念阈值下调
                 )
                 target = cmap.get(c, c)
                 if target != c:
-                    final_concept_map[c] = target # 找到了大哥，记录融合映射
+                    final_concept_map[c] = target
                 else:
-                    current_base.append(c) # 开山立派，成为新的参照基准
+                    current_base.append(c)
                 
                 # 进度播报 (每处理 30 个播报一次，防止刷屏)
-                if progress_callback and (idx + 1) % 30 == 0:
+                if progress_callback and (idx + 1) % 100 == 0:
                     await progress_callback(f"⏳ 正在深度清洗中... (已扫描 {idx + 1}/{len(all_concepts)} 个节点)")
                 
-                await asyncio.sleep(0.05) # 微小延迟，保护 API 不被熔断
+                await asyncio.sleep(0.01) # 🌟 既然极速了，防熔断延迟也可从 0.05 降到 0.01
 
             # ==========================================
             # 🌟 对学科 (Course) 也进行一次洗牌
@@ -671,7 +857,7 @@ class TutorBrain:
                     continue
                 cmap = await self.tagger.cluster_words(
                     [c], current_course_base, self.embedder, 
-                    direct_threshold=0.95, ai_threshold=0.90
+                    direct_threshold=0.95, ai_threshold=0.80 # 学科阈值下调
                 )
                 target = cmap.get(c, c)
                 if target != c:
@@ -703,6 +889,109 @@ class TutorBrain:
             from astrbot.api.all import logger
             logger.error(f"❌ [全库自清洗异常] {traceback.format_exc()}")
             return f"❌ 清洗过程发生错误: {e}"
+        
+    async def clean_file_graph(self, keyword: str, progress_callback=None) -> str:
+        """靶向清洗单文件：模糊匹配文件 -> 抽取相关概念 -> 与全库对齐合并 -> 重塑桥梁"""
+        try:
+            # 1. 复用遗忘机制中的模糊匹配逻辑，精准锁定文件
+            all_sources = self.sql_manager.get_all_source_names()
+            target = None
+            
+            if keyword in all_sources:
+                target = keyword
+            else:
+                matched = [s for s in all_sources if keyword in s]
+                if not matched: return f"⚠️ 找不到包含【{keyword}】的记录。"
+                if len(matched) > 1:
+                    return "⚠️ 触发安全拦截！匹配多条记录，请提供更精确的名称：\n" + "\n".join([f"🔸 {s}" for s in matched])
+                target = matched[0]
+
+            if progress_callback:
+                await progress_callback(f"🔍 锁定目标文件：[{target}]，正在逆向追踪其专属图谱节点...")
+
+            # 2. 从 ChromaDB 获取该文件所有的 chunk_id
+            try:
+                chunk_data = self.vector_store.chunks_collection.get(where={"source": target})
+                chunk_ids = chunk_data.get("ids", [])
+            except Exception as e:
+                return f"❌ 无法从向量库中读取文件元数据: {e}"
+
+            if not chunk_ids:
+                return f"📭 文件 [{target}] 没有包含任何有效切片，无需清洗。"
+
+            # 3. 查 SQLite 桥梁表，反向揪出这个文件污染了哪些概念
+            file_concepts = set()
+            with self.sql_manager._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(chunk_tag_mapping)")
+                columns = [col[1] for col in cur.fetchall()]
+                if not columns: return "❌ 数据库结构异常：找不到 chunk_tag_mapping 表。"
+                tag_col = "concept" if "concept" in columns else "tag" if "tag" in columns else "tag_name"
+
+                # 分批查询防止 SQLite 变量过多报错 (IN 语句上限 999)
+                for i in range(0, len(chunk_ids), 900):
+                    batch = chunk_ids[i:i+900]
+                    placeholders = ",".join(["?"] * len(batch))
+                    cur.execute(f"SELECT DISTINCT {tag_col} FROM chunk_tag_mapping WHERE chunk_id IN ({placeholders})", batch)
+                    file_concepts.update([row[0] for row in cur.fetchall()])
+
+            file_concepts = list(file_concepts)
+            if not file_concepts:
+                return f"📭 文件 [{target}] 没有提取到任何学术概念，无需清洗。"
+
+            if progress_callback:
+                await progress_callback(f"🧬 在该文件中发现了 {len(file_concepts)} 个概念节点，准备启动折叠算法与主图谱进行对齐...")
+
+            # 4. 获取全库基准池 (一定要把待清洗的文件概念剔除出去，防止自我匹配死锁！)
+            all_concepts = self.sql_manager.get_all_unique_concepts()
+            base_concepts = list(set(all_concepts) - set(file_concepts))
+
+            if not base_concepts:
+                 return "📭 全库目前没有其他成熟的概念作为参照物，无法进行对齐清洗哦。"
+
+            final_concept_map = {}
+            current_base = base_concepts.copy()
+
+            # 5. 仅针对该文件的概念进行 AI 聚类审判
+            for idx, c in enumerate(file_concepts):
+                cmap = await self.tagger.cluster_words(
+                    [c], current_base, self.embedder, 
+                    direct_threshold=0.92, ai_threshold=0.65 
+                )
+                target_concept = cmap.get(c, c)
+                
+                if target_concept != c:
+                    final_concept_map[c] = target_concept
+                else:
+                    # 如果审判认为这是一个正统的新词，就把它加入基准池，作为后续其他词的参照
+                    current_base.append(c) 
+
+                if progress_callback and (idx + 1) % 50 == 0:
+                    await progress_callback(f"⏳ 正在深度清洗文件中... (已比对 {idx + 1}/{len(file_concepts)} 个概念)")
+                    await asyncio.sleep(0.01)
+
+            # 6. 落盘与强制重塑重连
+            if not final_concept_map:
+                return f"✨ 文件 [{target}] 的图谱扫描完毕！概念非常纯净正统，没有发现需要合并的同义词呢~"
+
+            if progress_callback:
+                await progress_callback("💾 洗牌计算完成，正在执行底层数据库重构与映射桥梁重塑...")
+
+            # 同步更新 SQLite 概念池和 ChromaDB 的 Tags
+            self.sql_manager.apply_normalization_mapping({}, final_concept_map)
+            vdb_updated = self.vector_store.apply_normalization_mapping({}, final_concept_map)
+
+            # 🌟 核心：呼叫你之前的桥梁重连方法，让这些文件的物理切片挂载到新合并的大哥节点上
+            self._force_reconnect_mappings(final_concept_map)
+
+            merged_count = len(final_concept_map)
+            return f"🎉 【文件专属自清洗完成】\n可琳成功将文件 [{target}] 中的 {merged_count} 个不规范同义词融合到了主图谱中！\n(已安全重连底层切片羁绊，并摘除了 {vdb_updated} 个冗余向量)"
+
+        except Exception as e:
+            import traceback
+            from astrbot.api.all import logger
+            logger.error(f"❌ [单文件清洗异常] {traceback.format_exc()}")
+            return f"❌ 文件专属清洗过程发生错误: {e}"
         
     # =========================================================================
     # 🌟 知识图谱“手术刀”指令集
@@ -871,3 +1160,223 @@ class TutorBrain:
         except Exception as e:
             from astrbot.api.all import logger
             logger.error(f"❌ 强制重连图谱桥梁失败: {e}")
+
+    async def clean_ocr_text_with_llm(self, raw_text: str) -> str:
+        """基于 Map-Reduce 架构：单块并发清洗 + LLM 边界精准缝合"""
+        import aiohttp
+        import asyncio
+        import re
+        from astrbot.api.all import logger
+
+        # ==========================================
+        # 1. 物理切分：利用提取时的界碑切分
+        # ==========================================
+        pages = re.split(r'---\s*\[第\s*\d+\s*页提取片段\]\s*---', raw_text)
+        pages = [p.strip() for p in pages if p.strip()]
+
+        if not pages:
+            chunk_size = 3000
+            pages = [raw_text[i:i+chunk_size] for i in range(0, len(raw_text), chunk_size)]
+
+        batch_size = 3
+        batches = []
+        for i in range(0, len(pages), batch_size):
+            batches.append("\n\n".join(pages[i:i+batch_size]))
+
+        # ==========================================
+        # 2. Map 阶段：核心清洗引擎 (并发去噪修复)
+        # ==========================================
+        async def process_batch(idx: int, batch_str: str) -> tuple:
+            sys_p = "你是一个精准的 Markdown 排版引擎。只输出最终 Markdown，禁止任何废话。"
+            user_p = (
+    "【任务】物理级文本清洗：仅执行删除噪声与合并重复，零语义改动。\n\n"
+    
+    "【三阶操作】\n"
+    "1. **果断去重**：识别翻页导致的段落/公式重复（含变体如'第X页'、'（续）'），**必须合并为单一完整版本**，严禁并列输出。\n"
+    "2. **精准剔除**：删除页眉、页脚、页码、学校名（如'浙江大学'）、系统标记（如'[原文提取]:'）。**注意：删除≠改写**，移除噪声是物理清洗，不改变保留文本的语义。\n"
+    "3. **公式固化**：修正LaTeX语法，确保独立公式用$$包裹。严禁使用代码块！\\\\[\n"
+    "**关键格式禁令**：在$$块内，允许使用\\\\\\\\换行，但**严禁出现空行**（连续两个\\\\n），这会破坏LaTeX渲染。\n\n"
+    
+    "【红线】\n"
+    "- 保留文本逐字原样（除噪声外），禁止总结、缩写、调整语序。\n"
+    "- 重复内容只能出现一次，违者任务失败。\n\n"
+    
+    "【正例与反例】\n"
+    "✅ **正确**（公式内无空行）：\n```\n$$\nx = \\\\rho \\\\\ny = \\\\theta\n$$\n```\n"
+    "❌ **错误**（公式内出现空行，破坏语法）：\n```\n$$\nx = \\\\rho\n\ny = \\\\theta\n$$\n```\n\n"
+    
+    "✅ **正确**（果断删除页眉合并重复）：\n"
+    "输入含：'浙江大学 第2页\n二、牛顿定律\nF=ma\n浙江大学 第3页\n二、牛顿定律（续）\nF=ma，适用于宏观'\n"
+    "输出：'## 二、牛顿定律\n\nF=ma，适用于宏观'\n\n"
+    
+    f"【待处理文本】：\n{batch_str}"
+)
+            
+            try:
+                url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+                api_key = getattr(self, 'dashscope_key', '')
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                payload = {
+                    "model": "qwen-flash", 
+                    "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+                    "temperature": 0.1, 
+                }
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, headers=headers, json=payload, timeout=120) as resp:
+                        res_json = await resp.json()
+                        if resp.status == 200 and 'choices' in res_json:
+                            logger.info(f"[LLM Wash] ✅ 块 {idx} 内部清洗完成！")
+                            return idx, res_json['choices'][0]['message']['content']
+                        return idx, batch_str
+            except Exception as e:
+                return idx, batch_str
+
+        # 并发跑完所有批次
+        sem = asyncio.Semaphore(5) 
+        async def sem_process(idx, batch_str):
+            async with sem: return await process_batch(idx, batch_str)
+
+        tasks = [sem_process(i, b) for i, b in enumerate(batches)]
+        results = await asyncio.gather(*tasks)
+        results.sort(key=lambda x: x[0])
+        clean_batches = [text for _, text in results]
+
+        if len(clean_batches) <= 1:
+            return clean_batches[0] if clean_batches else ""
+
+        # ==========================================
+        # 3. Reduce 阶段：LLM 边界去重缝合引擎 (按换行符外推)
+        # ==========================================
+        async def fix_boundary_with_llm(left_text: str, right_text: str) -> str:
+            """按用户的思路：取边界外推至换行符，交给 LLM 融合，再拼回去"""
+            search_size = 800
+            
+            # --- 取左侧尾巴 ---
+            if len(left_text) <= search_size:
+                tail, cut_left = left_text, 0
+            else:
+                chunk = left_text[-search_size:]
+                idx = chunk.find('\n') # 向后寻找第一个换行符，保证取的是完整段落
+                idx = 0 if idx == -1 else idx
+                tail = chunk[idx:]
+                cut_left = len(left_text) - search_size + idx
+
+            # --- 取右侧头部 ---
+            if len(right_text) <= search_size:
+                head, cut_right = right_text, len(right_text)
+            else:
+                chunk = right_text[:search_size]
+                idx = chunk.rfind('\n') # 向前寻找最后一个换行符，保证取的是完整段落
+                idx = len(chunk) if idx == -1 else idx
+                head = chunk[:idx]
+                cut_right = idx
+
+            # --- 请求 LLM 去重缝合 ---
+            sys_p = "你是一个精准的文本去重合并工具。只输出合并后的文本，禁止任何解释。"
+            user_p = (
+                "下面是文档中相邻两页的接缝文本。由于翻页，它们中间可能存在重叠的段落或被截断的句子。\n"
+                "请找出它们的重叠部分，进行去重并无缝拼接，只保留一份完整信息。\n"
+                "如果完全没有重叠，请直接换行连接即可。禁止删减非重复的内容！\n\n"
+                f"【第一部分尾部】:\n{tail}\n\n"
+                f"【第二部分头部】:\n{head}"
+            )
+            
+            merged_boundary = tail + "\n\n" + head # 兜底默认拼接
+            try:
+                url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+                api_key = getattr(self, 'dashscope_key', '')
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                payload = {
+                    "model": "qwen-flash", 
+                    "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+                    "temperature": 0.1, 
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, headers=headers, json=payload, timeout=60) as resp:
+                        res_json = await resp.json()
+                        if resp.status == 200 and 'choices' in res_json:
+                            logger.info("[LLM Wash] 🪡 完成一处边界的智能缝合！")
+                            merged_boundary = res_json['choices'][0]['message']['content']
+            except Exception:
+                pass
+
+            # --- 拼回原文本 ---
+            return left_text[:cut_left].rstrip() + "\n\n" + merged_boundary.strip() + "\n\n" + right_text[cut_right:].lstrip()
+
+        # ==========================================
+        # 4. 滚动拼接装配线
+        # ==========================================
+        final_clean_text = clean_batches[0]
+        for i in range(1, len(clean_batches)):
+            final_clean_text = await fix_boundary_with_llm(final_clean_text, clean_batches[i])
+            
+        final_clean_text = final_clean_text.replace('$$$$', '$$')
+        return final_clean_text
+    
+    def get_file_concepts(self, keyword: str):
+        """获取指定文件包含的所有概念节点及其学科、频次信息"""
+        # 1. 模糊匹配锁定文件 (复用安全拦截机制)
+        all_sources = self.sql_manager.get_all_source_names()
+        target = None
+        
+        if keyword in all_sources:
+            target = keyword
+        else:
+            matched = [s for s in all_sources if keyword in s]
+            if not matched: return f"⚠️ 找不到包含【{keyword}】的记录。"
+            if len(matched) > 1:
+                return "⚠️ 触发安全拦截！匹配多条记录，请提供更精确的名称：\n" + "\n".join([f"🔸 {s}" for s in matched])
+            target = matched[0]
+
+        # 2. 从 ChromaDB 拿取该文件的所有 chunk_id
+        try:
+            chunk_data = self.vector_store.chunks_collection.get(where={"source": target})
+            chunk_ids = chunk_data.get("ids", [])
+        except Exception as e:
+            return f"❌ 无法从向量库中读取文件元数据: {e}"
+
+        if not chunk_ids:
+            return target, []
+
+        # 3. 顺藤摸瓜：通过 chunk_tag_mapping 揪出该文件所有概念
+        file_concepts = set()
+        with self.sql_manager._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(chunk_tag_mapping)")
+            columns = [col[1] for col in cur.fetchall()]
+            if not columns: return f"❌ 数据库结构异常：找不到 chunk_tag_mapping 表。"
+            tag_col = "concept" if "concept" in columns else "tag" if "tag" in columns else "tag_name"
+
+            # SQLite IN 语句最高支持 999 个，安全分批查询
+            for i in range(0, len(chunk_ids), 900):
+                batch = chunk_ids[i:i+900]
+                placeholders = ",".join(["?"] * len(batch))
+                cur.execute(f"SELECT DISTINCT {tag_col} FROM chunk_tag_mapping WHERE chunk_id IN ({placeholders})", batch)
+                file_concepts.update([row[0] for row in cur.fetchall()])
+
+        if not file_concepts:
+            return target, []
+
+        # 4. 从 concept_pool 补全这些概念的“学科 (course)”和“全库总频次 (frequency)”
+        concepts_info = []
+        with self.sql_manager._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(concept_pool)")
+            pool_columns = [col[1] for col in cur.fetchall()]
+            concept_col = "concept" if "concept" in pool_columns else "name"
+            
+            concepts_list = list(file_concepts)
+            for i in range(0, len(concepts_list), 900):
+                batch = concepts_list[i:i+900]
+                placeholders = ",".join(["?"] * len(batch))
+                cur.execute(f"SELECT course, {concept_col}, frequency FROM concept_pool WHERE {concept_col} IN ({placeholders})", batch)
+                for row in cur.fetchall():
+                    concepts_info.append({
+                        "course": row[0],
+                        "concept": row[1],
+                        "frequency": row[2]
+                    })
+
+        # 返回精确文件名，以及构建图谱所需的对象数组
+        return target, concepts_info

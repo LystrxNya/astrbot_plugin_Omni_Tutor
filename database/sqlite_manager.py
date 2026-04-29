@@ -388,7 +388,7 @@ class SQLiteManager:
 
     def apply_normalization_mapping(self, course_map: dict, concept_map: dict) -> int:
         """
-        🚀 重构后的光速洗牌：利用数据库级联操作，告别 Python 层面的 JSON 解包！
+        🚀 重构后的光速洗牌：利用数据库级联操作与数据融合机制 (完美适配真实字段名)
         """
         merged_count = len(course_map) + len(concept_map)
         if merged_count == 0: return 0
@@ -396,29 +396,60 @@ class SQLiteManager:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             
+            # ==========================================
             # 1. 替换二级（Course）
+            # ==========================================
             for old_c, new_c in course_map.items():
                 cursor.execute("UPDATE chunks SET course = ? WHERE course = ?", (new_c, old_c))
-                cursor.execute("UPDATE user_cognition SET course = ? WHERE course = ?", (new_c, old_c))
-                cursor.execute("UPDATE concept_pool SET course = ? WHERE course = ?", (new_c, old_c))
+                
+                # 学科合并：融合用户的认知数据 (🌟 修正字段名：mastery_level, struggle_index, query_count)
+                cursor.execute("""
+                    INSERT INTO user_cognition (uid, course, concept, query_count, mastery_level, struggle_index, last_interact)
+                    SELECT uid, ?, concept, query_count, mastery_level, struggle_index, last_interact FROM user_cognition WHERE course = ?
+                    ON CONFLICT(uid, course, concept) DO UPDATE SET 
+                        query_count = user_cognition.query_count + excluded.query_count,
+                        mastery_level = (user_cognition.mastery_level + excluded.mastery_level) / 2.0,
+                        struggle_index = MAX(user_cognition.struggle_index, excluded.struggle_index),
+                        last_interact = MAX(user_cognition.last_interact, excluded.last_interact);
+                """, (new_c, old_c))
+                cursor.execute("DELETE FROM user_cognition WHERE course = ?", (old_c,))
+                
+                # 学科合并：融合概念池词频
+                cursor.execute("""
+                    INSERT INTO concept_pool (course, concept, frequency)
+                    SELECT ?, concept, frequency FROM concept_pool WHERE course = ?
+                    ON CONFLICT(course, concept) DO UPDATE SET frequency = concept_pool.frequency + excluded.frequency;
+                """, (new_c, old_c))
+                cursor.execute("DELETE FROM concept_pool WHERE course = ?", (old_c,))
             
+            # ==========================================
             # 2. 替换三级（Concepts - 在倒排桥梁表中更新）
+            # ==========================================
             for old_c, new_c in concept_map.items():
-                # 将桥梁表中包含 old_c 的行转为 new_c，若已存在 new_c 则 IGNORE 忽略，然后删掉 old_c 对应行
+                # 桥梁表：纯关联关系，直接 IGNORE 然后删旧关系
                 cursor.execute('''
                     INSERT OR IGNORE INTO chunk_tag_mapping (chunk_id, tag_name)
                     SELECT chunk_id, ? FROM chunk_tag_mapping WHERE tag_name = ?
                 ''', (new_c, old_c))
                 cursor.execute("DELETE FROM chunk_tag_mapping WHERE tag_name = ?", (old_c,))
                 
-                # 同步认知表
-                cursor.execute("UPDATE user_cognition SET concept = ? WHERE concept = ?", (new_c, old_c))
+                # 🌟 修复点：同步认知表 (修正字段名，并安全合并查询次数)
+                cursor.execute("""
+                    INSERT INTO user_cognition (uid, course, concept, query_count, mastery_level, struggle_index, last_interact)
+                    SELECT uid, course, ?, query_count, mastery_level, struggle_index, last_interact FROM user_cognition WHERE concept = ?
+                    ON CONFLICT(uid, course, concept) DO UPDATE SET 
+                        query_count = user_cognition.query_count + excluded.query_count,
+                        mastery_level = (user_cognition.mastery_level + excluded.mastery_level) / 2.0,
+                        struggle_index = MAX(user_cognition.struggle_index, excluded.struggle_index),
+                        last_interact = MAX(user_cognition.last_interact, excluded.last_interact);
+                """, (new_c, old_c))
+                cursor.execute("DELETE FROM user_cognition WHERE concept = ?", (old_c,))
                 
                 # 概念池词频合并
                 cursor.execute("""
                     INSERT INTO concept_pool (course, concept, frequency)
                     SELECT course, ?, frequency FROM concept_pool WHERE concept = ?
-                    ON CONFLICT(course, concept) DO UPDATE SET frequency = frequency + excluded.frequency;
+                    ON CONFLICT(course, concept) DO UPDATE SET frequency = concept_pool.frequency + excluded.frequency;
                 """, (new_c, old_c))
                 cursor.execute("DELETE FROM concept_pool WHERE concept = ?", (old_c,))
             

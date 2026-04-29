@@ -25,13 +25,18 @@ class DocumentProcessor:
                 
         return False
 
-    def process(self, text: str) -> list[dict]:
+    def process(self, text: str, dynamic_chunk_size: int = None, dynamic_overlap_size: int = None) -> list[dict]:
         """
         主入口：将长篇 Markdown 文本切分为安全的 Chunk 列表
         🌟 返回格式已升级为附带元数据的字典列表：[{"text": "内容", "is_exercise": True/False}, ...]
+        🌟 新增支持：可动态传入探视器推荐的切片策略，若无则使用默认参数
         """
         if not text:
             return []
+            
+        # 🌟 采用动态参数，若未传入则使用初始化时的默认值
+        target_chunk_size = dynamic_chunk_size or self.chunk_size
+        target_overlap_size = dynamic_overlap_size or self.overlap_size
 
         # 1. 统一换行符
         text = text.replace('\r\n', '\n')
@@ -54,7 +59,8 @@ class DocumentProcessor:
             # 预测如果加入当前 block，长度是否超标
             predicted_length = len(current_chunk) + 2 + len(block)
 
-            if predicted_length <= self.chunk_size:
+            # 🌟 使用动态的 target_chunk_size 进行边界判断
+            if predicted_length <= target_chunk_size:
                 current_chunk += "\n\n" + block
             else:
                 # 🌟 超标了！保存当前 chunk 并打上是否为题目的 Tag
@@ -64,7 +70,8 @@ class DocumentProcessor:
                 })
                 
                 # 处理 Overlap（滑动窗口重叠）：从刚才保存的块尾部提取安全的段落，作为新块的开头
-                overlap_text = self._extract_safe_overlap(current_chunk)
+                # 🌟 透传 target_overlap_size
+                overlap_text = self._extract_safe_overlap(current_chunk, target_overlap_size)
                 current_chunk = overlap_text + "\n\n" + block if overlap_text else block
 
         # 将最后剩下的部分保存
@@ -106,10 +113,13 @@ class DocumentProcessor:
 
         return safe_blocks
 
-    def _extract_safe_overlap(self, chunk_text: str) -> str:
+    def _extract_safe_overlap(self, chunk_text: str, overlap_size: int = None) -> str:
         """
         从块尾部提取重叠文本，且保证是按“段落”提取，不会切碎句子
         """
+        # 🌟 兜底：如果没传 overlap_size，使用类初始化时的默认值
+        target_overlap = overlap_size if overlap_size is not None else self.overlap_size
+        
         blocks = chunk_text.split("\n\n")
         overlap_length = 0
         overlap_blocks = []
@@ -117,7 +127,7 @@ class DocumentProcessor:
         # 从后往前取段落
         for block in reversed(blocks):
             # 如果加入这个段落会导致重叠区过长，且我们已经拿到了一些重叠文本，就停止
-            if overlap_length + len(block) > self.overlap_size and overlap_blocks:
+            if overlap_length + len(block) > target_overlap and overlap_blocks:
                 break
             
             overlap_blocks.insert(0, block)

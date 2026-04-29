@@ -1,6 +1,8 @@
 import json
 import logging
 import asyncio
+import base64
+import os
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 
@@ -10,7 +12,7 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 class ConceptTagger:
-    def __init__(self, dashscope_key: str, fast_model: str = "qwen-turbo", reasoning_model: str = "qwen-plus"):
+    def __init__(self, dashscope_key: str, fast_model: str = "qwen-flash", reasoning_model: str = "qwen3.5-plus",vision_model: str = "qwen-vl-max"):
         # 🌟 直接使用 OpenAI 兼容模式连接阿里云百炼！
         self.client = AsyncOpenAI(
             api_key=dashscope_key,
@@ -18,42 +20,51 @@ class ConceptTagger:
         )
         self.fast_model = fast_model 
         self.reasoning_model = reasoning_model
+        self.vision_model = vision_model 
 
-    async def _call_llm(self, prompt: str, target_model: str, retries: int = 3, force_json: bool = True):
-        """🌟 极其稳定的 OpenAI 兼容模式 - JSON 强制输出"""
+    async def _call_llm(self, prompt: str, target_model: str, retries: int = 3, force_json: bool = True, images: List[str] = None):
+        """🌟 升级版：支持 OpenAI 标准的多模态图文输入"""
         
         if force_json and "json" not in prompt.lower():
             prompt = "【强制指令：你必须严格以 JSON 格式输出结果】\n" + prompt
 
         for attempt in range(retries):
             try:
+                # 组装消息体
+                content = [{"type": "text", "text": prompt}]
+                
+                if images:
+                    for img_path in images:
+                        if not os.path.exists(img_path): continue
+                        with open(img_path, "rb") as f:
+                            base64_img = base64.b64encode(f.read()).decode("utf-8")
+                        # 识别 mime 类型
+                        mime = "image/jpeg" if img_path.lower().endswith(('.jpg', '.jpeg')) else "image/png"
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{base64_img}"}
+                        })
+
                 kwargs = {
                     "model": target_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1, # 降低温度，保证 JSON 稳定性
+                    "messages": [{"role": "user", "content": content}],
+                    "temperature": 0.1,
                 }
                 
-                # OpenAI 标准的 JSON 模式开启方法
                 if force_json:
                     kwargs["response_format"] = {"type": "json_object"}
 
-                # 🌟 调用标准接口，彻底告别 400 URL Error
                 completion = await self.client.chat.completions.create(**kwargs)
-                content = completion.choices[0].message.content
-                
-                if force_json:
-                    return json.loads(content)
-                else:
-                    return content
+                res_content = completion.choices[0].message.content
+                return json.loads(res_content) if force_json else res_content
 
             except Exception as e:
                 if attempt < retries - 1:
                     await asyncio.sleep(2)
                     continue
-                logger.error(f"❌ LLM JSON API请求异常: {e}")
-                # 兜底返回，防止系统崩溃
+                logger.error(f"❌ LLM 意图识别请求异常: {e}")
                 return {} if force_json else ""
-
+        
     async def _call_llm_text(self, prompt: str, target_model: str) -> str:
         """🌟 极其稳定的 OpenAI 兼容模式 - 纯文本/Markdown 深度输出"""
         try:
@@ -134,35 +145,41 @@ class ConceptTagger:
     # 🌟 阶段二：多维意图检索与答疑 (Retrieval & Synthesis)
     # =========================================================================
 
-    async def analyze_multi_intent(self, query: str) -> List[Dict]:
-        """步 1：多重意图裂变 (🌟 完全抛弃学科束缚，聚焦纯概念与教学类型)"""
+    async def analyze_multi_intent(self, query: str, images: List[str] = None) -> List[Dict]:
+        """
+        步 1：多重意图裂变 (🌟 视觉增强 + CoT 广度扩展版)
+        """
         
         prompt = f"""
-        你是一个顶级的数据检索路由专家。请根据用户的提问，进行动态“意图裂变”，提取检索条件。必须输出 JSON 格式。
+        你是一个顶级的学术意图路由专家与检索词扩展专家。
+        请深度分析用户的提问（及图片题目,若有），进行多维度的“意图裂变”，提取出能够最大化知识召回率的关键词。
         
-        【用户提问】：{query}
+        【用户提问】：{query if query else "（见图片内容）"}
         
-        【意图裂变规则】：
-        1. 提取提问中的核心二级概念（concepts），作为检索的锚点。
-        2. 判断用户需要的教学内容类型（pedagogy_type）。🌟 必须且只能从以下 4 项中选取 1-2 项：
-           - ["定义定理"]：用户在问“是什么/公式/概念/含义”。
-           - ["实际应用"]：用户在问“怎么用/解决什么问题/现实场景”。
-           - ["练习"]：用户在找“例题/计算题/题目/怎么做”。
-           - ["拓展"]：用户在问“历史背景/延伸阅读/证明过程”。
+        【裂变规则】：
+        1. **思维链先行 (CoT)**：在提取关键词前，必须先在 `analysis` 字段中简要推演解题需要的完整知识链路。严格限制三句话以内。
+        2. **全维度概念提取**：基于你的推演，在 `concepts` 数组中**必须提取 5 到 10 个**精准的学术名词。必须涵盖以下维度：
+           - 粗粒度大类：提取所属粗粒度知识点（如：三重积分、电路分析、数列收敛）。
+           - 微观考点：直接考察的公式/定理（如：洛必达法则、节点电压法）。
+           - 隐含前置知识：推导必备的基础概念（如：等价无穷小、受力分析）。
+           - 解题工具/方法：实际计算需要的数学工具（如：分部积分、极坐标变换）。
+        3. **类型判定** (pedagogy_type)：必须从 [定义定理, 实际应用, 练习, 拓展] 中选择。若图片是题目，必须包含“练习”。
         
-        【要求输出的 JSON 数组格式】：
+        【输出 JSON】：
         {{
             "intents": [
                 {{
-                    "concepts": ["核心概念1", "核心概念2"], // 自由提炼，尽量精简，必须是专有名词
-                    "pedagogy_type": ["定义定理"] // 严格从上述 4 项中选取
+                    "analysis": "这里简要写出你的分析过程，严格限制三句话以后，拆解这道题具体考察了什么，隐含了什么前置知识...",
+                    "concepts": ["粗粒度知识点", "微观考点1", "隐含知识2", "解题方法3", "易错点4", "工具5"], 
+                    "pedagogy_type": ["你判定的教学类型，取值严格限定为：定义定理, 实际应用, 练习, 拓展 中的一个或多个"]
                 }}
             ]
         }}
         """
         try:
-            # 明确指定 force_json=True
-            res = await self._call_llm(prompt, target_model=self.reasoning_model, force_json=True)
+            # 如果有图片，强制使用视觉模型进行裂变
+            target = self.vision_model if images else self.reasoning_model
+            res = await self._call_llm(prompt, target_model=target, images=images, force_json=True)
             return res.get("intents", [])
         except Exception as e:
             from astrbot.api.all import logger
@@ -498,3 +515,38 @@ class ConceptTagger:
                 "pedagogy": {"type": ["拓展"]},
                 "boundary": {"completeness": "相对完整", "context_loss": False, "chapter_transition": False}
             }
+        
+    async def analyze_chunk_strategy(self, sample_text: str) -> Dict:
+        """
+        【新增】工程级文档探视：根据样例文本的知识密度、文本风格，动态推荐最佳切片参数
+        """
+        prompt = f"""
+        你是一个顶级的 RAG 向量检索架构师。
+        请分析以下从长文档中随机抽样的两段切片，评估其“知识密度”和“文本风格”，并给出最适合该文档的物理切片参数。
+        
+        【抽样切片】：
+        {sample_text}
+        
+        【评估与参数设定法则】：
+        1. 知识密度极高（如：满篇公式推导、密集名词定义、理科题目）：
+           -> 建议减小切片以提高向量纯度 (chunk_size: 300~600)，知识密度越高切片越小；增加重叠度防止推导逻辑断裂 (overlap_size: 150~200)。
+        2. 知识密度中等（如：标准教科书、科普文章）：
+           -> 建议使用标准均衡参数 (chunk_size: 800, overlap_size: 150)。
+        3. 知识密度较低/偏叙事（如：小说、历史传记、日常对话）：
+           -> 建议大块切分以保留宏观上下文 (chunk_size: 1000~1200)；减小重叠度降低冗余 (overlap_size: 100)。
+           
+        【强制 JSON 输出】：
+        {{
+            "chunk_size": 800, // 整数值
+            "overlap_size": 150, // 整数值
+            "reason": "请用一句话(20字内)简述判定理由，例如：'包含大量硬核公式推导，需小块高重叠以防断裂。'"
+        }}
+        """
+        try:
+            # 🌟 使用推理模型 (慢脑) 进行探视
+            res = await self._call_llm(prompt, target_model=self.reasoning_model, force_json=True)
+            return res
+        except Exception as e:
+            from astrbot.api.all import logger
+            logger.warning(f"⚠️ 动态切片策略推演失败，将使用默认参数: {e}")
+            return {"chunk_size": 800, "overlap_size": 150, "reason": "探视失败，采用保守标准策略"}
